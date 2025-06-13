@@ -61,7 +61,7 @@ use crate::{
         UpdatePublicKeyParams,
         move_structs::{Authorized, BlobAttribute, EmergencyUpgradeCap, NodeMetadata, WalExchange},
     },
-    utils::{MAX_SUBSIDY_RATE, price_for_encoded_length, write_price_for_encoded_length},
+    utils::{MAX_BUYER_SUBSIDY_RATE, price_for_encoded_length, write_price_for_encoded_length},
 };
 
 const CLOCK_OBJECT_ARG: ObjectArg = ObjectArg::SharedObject {
@@ -1592,8 +1592,9 @@ impl WalrusPtbBuilder {
                     .sui_client()
                     .get_subsidies_object(subsidies_object_id)
                     .await?;
-                full_price * (MAX_SUBSIDY_RATE - subsidies_object.buyer_subsidy_rate as u64)
-                    / MAX_SUBSIDY_RATE
+                (full_price
+                    * (MAX_BUYER_SUBSIDY_RATE - u64::from(subsidies_object.buyer_subsidy_rate)))
+                .div_ceil(MAX_BUYER_SUBSIDY_RATE)
             }
             Some(_) => full_price,
             None => full_price,
@@ -1619,7 +1620,8 @@ impl WalrusPtbBuilder {
                     .get_subsidies_object(subsidies_object_id)
                     .await?
                     .buyer_subsidy_rate;
-                if buyer_subsidy_rate as u64 == MAX_SUBSIDY_RATE {
+                // Hack until new subsidy is integrated with system contract
+                if u64::from(buyer_subsidy_rate) == MAX_BUYER_SUBSIDY_RATE {
                     0
                 } else {
                     full_price
