@@ -28,12 +28,7 @@ use sui_sdk::{
     },
     types::base_types::ObjectID,
 };
-use sui_types::{
-    TypeTag,
-    base_types::SuiAddress,
-    event::EventID,
-    transaction::{Argument, ProgrammableTransaction, TransactionData, TransactionKind},
-};
+use sui_types::{TypeTag, base_types::SuiAddress, event::EventID, transaction::TransactionData};
 use tokio::sync::Mutex;
 use tokio_stream::Stream;
 use tracing::Level;
@@ -1535,11 +1530,12 @@ impl SuiContractClientInner {
         match subsidies_package_id {
             Some(pkg_id) => {
                 match self
-                    .reserve_and_register_blobs_with_subsidies(
+                    .reserve_and_register_blobs_inner(
                         epochs_ahead,
                         blob_metadata_list.clone(),
                         persistence,
                         pkg_id,
+                        true,
                     )
                     .await
                 {
@@ -1551,10 +1547,12 @@ impl SuiContractClientInner {
                             "Walrus package version mismatch in subsidies call, \
                             falling back to direct contract call"
                         );
-                        self.reserve_and_register_blobs_without_subsidies(
+                        self.reserve_and_register_blobs_inner(
                             epochs_ahead,
                             blob_metadata_list.clone(),
                             persistence,
+                            ObjectID::random(),
+                            false,
                         )
                         .await
                     }
@@ -1562,23 +1560,26 @@ impl SuiContractClientInner {
                 }
             }
             None => {
-                self.reserve_and_register_blobs_without_subsidies(
+                self.reserve_and_register_blobs_inner(
                     epochs_ahead,
                     blob_metadata_list,
                     persistence,
+                    ObjectID::random(),
+                    false,
                 )
                 .await
             }
         }
     }
 
-    /// reserve and register blobs with subsidies
-    pub async fn reserve_and_register_blobs_with_subsidies(
+    /// reserve and register blobs inner
+    pub async fn reserve_and_register_blobs_inner(
         &mut self,
         epochs_ahead: EpochCount,
         blob_metadata_list: Vec<BlobObjectMetadata>,
         persistence: BlobPersistence,
         subsidies_package_id: ObjectID,
+        with_subsidies: bool,
     ) -> SuiClientResult<Vec<Blob>> {
         if blob_metadata_list.is_empty() {
             tracing::debug!("no blobs to register");
@@ -1598,9 +1599,22 @@ impl SuiContractClientInner {
             .iter()
             .fold(0, |acc, metadata| acc + metadata.encoded_size);
 
-        let main_storage_arg = pt_builder
-            .reserve_space_with_subsidies(main_storage_arg_size, epochs_ahead, subsidies_package_id)
-            .await?;
+        let main_storage_arg = match with_subsidies {
+            true => {
+                pt_builder
+                    .reserve_space_with_subsidies(
+                        main_storage_arg_size,
+                        epochs_ahead,
+                        subsidies_package_id,
+                    )
+                    .await?
+            }
+            false => {
+                pt_builder
+                    .reserve_space_without_subsidies(main_storage_arg_size, epochs_ahead)
+                    .await?
+            }
+        };
 
         for blob_metadata in blob_metadata_list.into_iter() {
             // Split off a storage resource, unless the remainder is equal to the required size.
@@ -1612,83 +1626,33 @@ impl SuiContractClientInner {
             } else {
                 main_storage_arg
             };
-            pt_builder
-                .register_blob_with_subsidies(
-                    storage_arg.into(),
-                    blob_metadata,
-                    persistence,
-                    subsidies_package_id,
-                )
-                .await?;
-        }
 
-        let transaction = pt_builder.build_transaction_data(self.gas_budget).await?;
-        let res = self
-            .sign_and_send_transaction(transaction, "reserve_and_register_blobs_with_subsidies")
-            .await?;
-        let blob_obj_ids = get_created_sui_object_ids_by_type(
-            &res,
-            &contracts::blob::Blob
-                .to_move_struct_tag_with_type_map(&self.read_client.type_origin_map(), &[])?,
-        )?;
-
-        ensure!(
-            blob_obj_ids.len() == expected_num_blobs,
-            "unexpected number of blob objects created: {} expected {} ",
-            blob_obj_ids.len(),
-            expected_num_blobs
-        );
-
-        self.sui_client().get_sui_objects(&blob_obj_ids).await
-    }
-
-    /// reserve and register blobs without subsidies
-    pub async fn reserve_and_register_blobs_without_subsidies(
-        &mut self,
-        epochs_ahead: EpochCount,
-        blob_metadata_list: Vec<BlobObjectMetadata>,
-        persistence: BlobPersistence,
-    ) -> SuiClientResult<Vec<Blob>> {
-        if blob_metadata_list.is_empty() {
-            tracing::debug!("no blobs to register");
-            return Ok(vec![]);
-        }
-
-        let expected_num_blobs = blob_metadata_list.len();
-        tracing::debug!(
-            num_blobs = expected_num_blobs,
-            "starting to reserve and register blobs"
-        );
-
-        let mut pt_builder = self.transaction_builder()?;
-
-        // Reserve enough space for all blobs
-        let mut main_storage_arg_size = blob_metadata_list
-            .iter()
-            .fold(0, |acc, metadata| acc + metadata.encoded_size);
-
-        let main_storage_arg = pt_builder
-            .reserve_space_without_subsidies(main_storage_arg_size, epochs_ahead)
-            .await?;
-
-        for blob_metadata in blob_metadata_list.into_iter() {
-            // Split off a storage resource, unless the remainder is equal to the required size.
-            let storage_arg = if main_storage_arg_size != blob_metadata.encoded_size {
-                main_storage_arg_size -= blob_metadata.encoded_size;
-                pt_builder
-                    .split_storage_by_size(main_storage_arg.into(), main_storage_arg_size)
-                    .await?
-            } else {
-                main_storage_arg
+            match with_subsidies {
+                true => {
+                    pt_builder
+                        .register_blob_with_subsidies(
+                            storage_arg.into(),
+                            blob_metadata,
+                            persistence,
+                            subsidies_package_id,
+                        )
+                        .await?
+                }
+                false => {
+                    pt_builder
+                        .register_blob_without_subsidies(
+                            storage_arg.into(),
+                            blob_metadata,
+                            persistence,
+                        )
+                        .await?
+                }
             };
-            pt_builder
-                .register_blob_without_subsidies(storage_arg.into(), blob_metadata, persistence)
-                .await?;
         }
 
         let transaction = pt_builder.build_transaction_data(self.gas_budget).await?;
         let res = self
-            .sign_and_send_transaction(transaction, "reserve_and_register_blobs_without_subsidies")
+            .sign_and_send_transaction(transaction, "reserve_and_register_blobs_inner")
             .await?;
         let blob_obj_ids = get_created_sui_object_ids_by_type(
             &res,
