@@ -167,47 +167,64 @@ impl WalrusPtbBuilder {
     /// Returns a [`SuiClientError::NoCompatibleWalCoins`] if no WAL coins with sufficient balance
     /// can be found.
     pub async fn fill_wal_balance(&mut self, min_balance: u64) -> SuiClientResult<()> {
-        if min_balance <= self.tx_wal_balance {
+        // If we already have a wal_coin_arg and sufficient balance, we're done
+        if min_balance <= self.tx_wal_balance && self.wal_coin_arg.is_some() {
             return Ok(());
         }
-        let additional_balance = min_balance - self.tx_wal_balance;
-        let mut coins = self
-            .read_client
-            .get_coins_with_total_balance(
-                self.sender_address,
-                CoinType::Wal,
-                additional_balance,
-                self.used_wal_coins.iter().cloned().collect(),
-            )
-            .await?;
-        let mut added_balance = 0;
-        let main_coin = if let Some(coin_arg) = self.wal_coin_arg {
-            coin_arg
-        } else {
+
+        // If we don't have a wal_coin_arg yet, we need to select at least one coin
+        if self.wal_coin_arg.is_none() {
+            let mut coins = self
+                .read_client
+                .get_coins_with_total_balance(
+                    self.sender_address,
+                    CoinType::Wal,
+                    0, // Get at least a zero coin
+                    self.used_wal_coins.iter().cloned().collect(),
+                )
+                .await?;
+
             let coin = coins
                 .pop()
                 .ok_or_else(|| SuiClientError::NoCompatibleWalCoins)?;
-            // Make sure that we don't select the same coin later again.
             self.used_wal_coins.insert(coin.coin_object_id);
-            added_balance += coin.balance;
             let coin_arg = self.pt_builder.input(coin.object_ref().into())?;
             self.wal_coin_arg = Some(coin_arg);
-            coin_arg
-        };
-        if !coins.is_empty() {
-            let coin_args = coins
-                .into_iter()
-                .map(|coin| {
-                    // Make sure that we don't select the same coin later again.
-                    self.used_wal_coins.insert(coin.coin_object_id);
-                    added_balance += coin.balance;
-                    self.pt_builder.input(coin.object_ref().into())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.pt_builder
-                .command(Command::MergeCoins(main_coin, coin_args));
+            self.tx_wal_balance += coin.balance;
         }
-        self.tx_wal_balance += added_balance;
+
+        // If we still need more balance, get additional coins
+        if min_balance > self.tx_wal_balance {
+            let additional_balance = min_balance - self.tx_wal_balance;
+            let coins = self
+                .read_client
+                .get_coins_with_total_balance(
+                    self.sender_address,
+                    CoinType::Wal,
+                    additional_balance,
+                    self.used_wal_coins.iter().cloned().collect(),
+                )
+                .await?;
+
+            if !coins.is_empty() {
+                let main_coin = self.wal_coin_arg.ok_or_else(|| {
+                    SuiClientError::Internal(anyhow::anyhow!(
+                        "wal_coin_arg should be set when adding additional coins"
+                    ))
+                })?;
+                let coin_args = coins
+                    .into_iter()
+                    .map(|coin| {
+                        self.used_wal_coins.insert(coin.coin_object_id);
+                        self.tx_wal_balance += coin.balance;
+                        self.pt_builder.input(coin.object_ref().into())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.pt_builder
+                    .command(Command::MergeCoins(main_coin, coin_args));
+            }
+        }
+
         Ok(())
     }
 
@@ -295,6 +312,7 @@ impl WalrusPtbBuilder {
             .storage_price_for_encoded_length(encoded_size, epochs_ahead, true)
             .await?;
         self.fill_wal_balance(price).await?;
+
         let reserve_arguments = vec![
             self.subsidies_arg(Mutability::Mutable).await?,
             self.system_arg(Mutability::Mutable).await?,
