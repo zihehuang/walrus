@@ -172,59 +172,44 @@ impl WalrusPtbBuilder {
             return Ok(());
         }
 
-        // If we don't have a wal_coin_arg yet, we need to select at least one coin
-        if self.wal_coin_arg.is_none() {
-            let mut coins = self
-                .read_client
-                .get_coins_with_total_balance(
-                    self.sender_address,
-                    CoinType::Wal,
-                    0, // Get at least a zero coin
-                    self.used_wal_coins.iter().cloned().collect(),
-                )
-                .await?;
-
+        let additional_balance = min_balance - self.tx_wal_balance;
+        let mut coins = self
+            .read_client
+            .get_coins_with_total_balance(
+                self.sender_address,
+                CoinType::Wal,
+                additional_balance,
+                self.used_wal_coins.iter().cloned().collect(),
+            )
+            .await?;
+        let mut added_balance = 0;
+        let main_coin = if let Some(coin_arg) = self.wal_coin_arg {
+            coin_arg
+        } else {
             let coin = coins
                 .pop()
                 .ok_or_else(|| SuiClientError::NoCompatibleWalCoins)?;
+            // Make sure that we don't select the same coin later again.
             self.used_wal_coins.insert(coin.coin_object_id);
+            added_balance += coin.balance;
             let coin_arg = self.pt_builder.input(coin.object_ref().into())?;
             self.wal_coin_arg = Some(coin_arg);
-            self.tx_wal_balance += coin.balance;
+            coin_arg
+        };
+        if !coins.is_empty() {
+            let coin_args = coins
+                .into_iter()
+                .map(|coin| {
+                    // Make sure that we don't select the same coin later again.
+                    self.used_wal_coins.insert(coin.coin_object_id);
+                    added_balance += coin.balance;
+                    self.pt_builder.input(coin.object_ref().into())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.pt_builder
+                .command(Command::MergeCoins(main_coin, coin_args));
         }
-
-        // If we still need more balance, get additional coins
-        if min_balance > self.tx_wal_balance {
-            let additional_balance = min_balance - self.tx_wal_balance;
-            let coins = self
-                .read_client
-                .get_coins_with_total_balance(
-                    self.sender_address,
-                    CoinType::Wal,
-                    additional_balance,
-                    self.used_wal_coins.iter().cloned().collect(),
-                )
-                .await?;
-
-            if !coins.is_empty() {
-                let main_coin = self.wal_coin_arg.ok_or_else(|| {
-                    SuiClientError::Internal(anyhow::anyhow!(
-                        "wal_coin_arg should be set when adding additional coins"
-                    ))
-                })?;
-                let coin_args = coins
-                    .into_iter()
-                    .map(|coin| {
-                        self.used_wal_coins.insert(coin.coin_object_id);
-                        self.tx_wal_balance += coin.balance;
-                        self.pt_builder.input(coin.object_ref().into())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.pt_builder
-                    .command(Command::MergeCoins(main_coin, coin_args));
-            }
-        }
-
+        self.tx_wal_balance += added_balance;
         Ok(())
     }
 
@@ -1610,9 +1595,9 @@ impl WalrusPtbBuilder {
                     .sui_client()
                     .get_subsidies_object(subsidies_object_id)
                     .await?;
-                (full_price
-                    * (MAX_BUYER_SUBSIDY_RATE - u64::from(subsidies_object.buyer_subsidy_rate)))
-                .div_ceil(MAX_BUYER_SUBSIDY_RATE)
+                let subsidy = full_price * u64::from(subsidies_object.buyer_subsidy_rate)
+                    / MAX_BUYER_SUBSIDY_RATE;
+                full_price - subsidy
             }
             Some(_) => full_price,
             None => full_price,
@@ -1638,7 +1623,7 @@ impl WalrusPtbBuilder {
                     .get_subsidies_object(subsidies_object_id)
                     .await?
                     .buyer_subsidy_rate;
-                // Hack until new subsidy is integrated with system contract
+                // TODO: (WAL-905) Hack until new subsidy is integrated with system contract
                 if u64::from(buyer_subsidy_rate) == MAX_BUYER_SUBSIDY_RATE {
                     0
                 } else {

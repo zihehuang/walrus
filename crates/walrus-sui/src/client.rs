@@ -1599,21 +1599,18 @@ impl SuiContractClientInner {
             .iter()
             .fold(0, |acc, metadata| acc + metadata.encoded_size);
 
-        let main_storage_arg = match with_subsidies {
-            true => {
-                pt_builder
-                    .reserve_space_with_subsidies(
-                        main_storage_arg_size,
-                        epochs_ahead,
-                        subsidies_package_id,
-                    )
-                    .await?
-            }
-            false => {
-                pt_builder
-                    .reserve_space_without_subsidies(main_storage_arg_size, epochs_ahead)
-                    .await?
-            }
+        let main_storage_arg = if with_subsidies {
+            pt_builder
+                .reserve_space_with_subsidies(
+                    main_storage_arg_size,
+                    epochs_ahead,
+                    subsidies_package_id,
+                )
+                .await?
+        } else {
+            pt_builder
+                .reserve_space_without_subsidies(main_storage_arg_size, epochs_ahead)
+                .await?
         };
 
         for blob_metadata in blob_metadata_list.into_iter() {
@@ -1627,26 +1624,19 @@ impl SuiContractClientInner {
                 main_storage_arg
             };
 
-            match with_subsidies {
-                true => {
-                    pt_builder
-                        .register_blob_with_subsidies(
-                            storage_arg.into(),
-                            blob_metadata,
-                            persistence,
-                            subsidies_package_id,
-                        )
-                        .await?
-                }
-                false => {
-                    pt_builder
-                        .register_blob_without_subsidies(
-                            storage_arg.into(),
-                            blob_metadata,
-                            persistence,
-                        )
-                        .await?
-                }
+            if with_subsidies {
+                pt_builder
+                    .register_blob_with_subsidies(
+                        storage_arg.into(),
+                        blob_metadata,
+                        persistence,
+                        subsidies_package_id,
+                    )
+                    .await?
+            } else {
+                pt_builder
+                    .register_blob_without_subsidies(storage_arg.into(), blob_metadata, persistence)
+                    .await?
             };
         }
 
