@@ -61,7 +61,7 @@ use crate::{
         UpdatePublicKeyParams,
         move_structs::{Authorized, BlobAttribute, EmergencyUpgradeCap, NodeMetadata, WalExchange},
     },
-    utils::{MAX_BUYER_SUBSIDY_RATE, price_for_encoded_length, write_price_for_encoded_length},
+    utils::{TEN_THOUSAND_BASIS_POINTS, price_for_encoded_length, write_price_for_encoded_length},
 };
 
 const CLOCK_OBJECT_ARG: ObjectArg = ObjectArg::SharedObject {
@@ -1596,7 +1596,7 @@ impl WalrusPtbBuilder {
                     .get_subsidies_object(subsidies_object_id)
                     .await?;
                 let subsidy = full_price * u64::from(subsidies_object.buyer_subsidy_rate)
-                    / MAX_BUYER_SUBSIDY_RATE;
+                    / TEN_THOUSAND_BASIS_POINTS;
                 full_price - subsidy
             }
             Some(_) => full_price,
@@ -1624,7 +1624,7 @@ impl WalrusPtbBuilder {
                     .await?
                     .buyer_subsidy_rate;
                 // TODO: (WAL-905) Hack until new subsidy is integrated with system contract
-                if u64::from(buyer_subsidy_rate) == MAX_BUYER_SUBSIDY_RATE {
+                if u64::from(buyer_subsidy_rate) == TEN_THOUSAND_BASIS_POINTS {
                     0
                 } else {
                     full_price
