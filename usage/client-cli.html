@@ -59,6 +59,8 @@
               window.addEventListener("load", initAskCookbook);
             }
           </script>
+        
+          <meta name="algolia-site-verification" content="BCA21DA2879818D2">
 
         <meta name="description" content="">
         <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -335,23 +337,42 @@ command.</p>
 <p>Storing one or multiple blobs on Walrus can be achieved through the following command:</p>
 <pre><code class="language-sh">walrus store &lt;FILES&gt; --epochs &lt;EPOCHS&gt;
 </code></pre>
-<p>A mandatory CLI argument must be set to specify the end epoch for the blob.
-The <code>--epochs &lt;EPOCHS&gt;</code> option indicates the number of epochs the blob should be
-stored for. There is an upper limit on the number of epochs a blob can be stored for, which is 53,
-corresponding to two years. In addition to a positive integer,
-you can also use <code>--epochs max</code> to store the blob for the maximum number of epochs.</p>
-<p>Moreover, the end epoch for the stored blob can be provided through other options. The
-<code>--earliest-expiry-time &lt;EARLIEST_EXPIRY_TIME&gt;</code> option takes a date in RFC3339 format
+<p>A mandatory CLI argument must be set to specify the lifetime for the blob. There are currently three
+ways for this:</p>
+<ol>
+<li>The <code>--epochs &lt;EPOCHS&gt;</code> option indicates the number of epochs the blob should be stored for.
+There is an upper limit on the number of epochs a blob can be stored for, which is 53, corresponding
+to two years. In addition to a positive integer, you can also use <code>--epochs max</code> to store the blob
+for the maximum number of epochs. Note that the end epoch is defined as the current epoch plus the
+specified number of epochs.</li>
+<li>The <code>--earliest-expiry-time &lt;EARLIEST_EXPIRY_TIME&gt;</code> option takes a date in RFC3339 format
 (e.g., "2024-03-20T15:00:00Z") or a more relaxed format (e.g., "2024-03-20 15:00:00") and ensures
-the blob expires after that date if possible. Finally, the <code>--end-epoch &lt;END_EPOCH&gt;</code> option takes
-a specific end epoch for the blob.</p>
+the blob expires after that date if possible.</li>
+<li>The <code>--end-epoch &lt;END_EPOCH&gt;</code> option takes a specific end epoch for the blob.</li>
+</ol>
+<div id="admonition-end-epoch" class="admonition admonish-warning" role="note" aria-labelledby="admonition-end-epoch-title">
+<div class="admonition-title">
+<div id="admonition-end-epoch-title">
+<p>End epoch</p>
+</div>
+<a class="admonition-anchor-link" href="#admonition-end-epoch"></a>
+</div>
+<div>
+<p>A blob expires <em>at the beginning of its end epoch</em>. For example, a blob with end epoch <code>314</code> will
+become unavailable at the beginning of epoch <code>314</code>. One consequence of this is that when storing a
+blob with <code>--epochs 1</code> immediately before an epoch change, it will expire and become unavailable
+almost immediately. Note that blobs can be <a href="#extending-the-lifetime-of-a-blob">extended</a> only if
+they have not expired.</p>
+</div>
+</div>
 <p>You can store a single file or multiple files, separated by spaces. Notably, this is compatible
 with glob patterns; for example, <code>walrus store *.png --epochs &lt;EPOCHS&gt;</code> will store all PNG files
 in the current directory.</p>
-<p>By default, the command will store the blob as a <em>permanent</em> blob. See the <a href="#reclaiming-space-via-deletable-blobs">section on deletable
-blobs</a> for more details on deletable blobs. Also, by default
-an owned <code>Blob</code> object is created. It is possible to wrap this into a shared object, which can be
-funded and extended by anyone, see the <a href="#shared-blobs">shared blobs section</a>.</p>
+<p>By default, the command will store the blob as a <em>permanent</em> blob, although this is going to change
+in the near future. See the <a href="#reclaiming-space-via-deletable-blobs">section on deletable blobs</a> for more
+details on deletable blobs. Also, by default an owned <code>Blob</code> object is created. It is possible to
+wrap this into a shared object, which can be funded and extended by anyone, see the <a href="#shared-blobs">shared blobs
+section</a>.</p>
 <p>When storing a blob, the client performs a number of automatic optimizations, including the
 following:</p>
 <ul>
@@ -398,12 +419,12 @@ a Sui RPC node to use instead of the one set in the wallet configuration or the 
 <p>Recall that when you stored your blob, it was necessary to specify its <a href="#storing-blobs">end epoch</a>.
 By specifying the end epoch you ensured that the blob would be available via <code>walrus read</code> (or other
 SDK access to Walrus) until that end epoch is reached.</p>
-<p>Walrus blob lifetimes can be extended using the <code>walrus extend --blob-obj-id &lt;blob object id&gt; ...</code>
-command. Both regular single-address owned blobs and <a href="#shared-blobs">shared blobs</a> may be extended.
-Shared blobs may be extended by anyone, but owned blobs may only be extended by their owner. When
-extending a shared blob, you will need to supply the <code>--shared</code> flag to inform the command that the
-blob is shared.</p>
-<p>Note that the blob's <em>object ID</em> will be needed in order to extend it. The blob ID is not needed.
+<p>Walrus blob lifetimes can be extended <em>as long as the blobs are not expired</em> using the
+<code>walrus extend --blob-obj-id &lt;blob object id&gt; ...</code> command. Both regular single-address owned blobs
+and <a href="#shared-blobs">shared blobs</a> may be extended. Shared blobs may be extended by anyone, but owned
+blobs may only be extended by their owner. When extending a shared blob, you will need to supply the
+<code>--shared</code> flag to inform the command that the blob is shared.</p>
+<p>Note that the blob's <em>object ID</em> will be needed in order to extend it, the blob ID is not needed.
 See <code>walrus extend --help</code> for more information on blob extension.</p>
 <h2 id="reclaiming-space-via-deletable-blobs"><a class="header" href="#reclaiming-space-via-deletable-blobs">Reclaiming space via deletable blobs</a></h2>
 <p>By default <code>walrus store</code> uploads a permanent blob available until after its expiry
@@ -456,7 +477,7 @@ share a newly created blob by adding the <code>--share</code> option to the <cod
 <p>Shared blobs can only contain permanent blobs and as such cannot be deleted before their expiry.</p>
 <p>See <a href="#extending-the-lifetime-of-a-blob">this section</a> for more on blob extension.</p>
 <h2 id="batch-storing-blobs-with-quilts"><a class="header" href="#batch-storing-blobs-with-quilts">Batch-storing blobs with quilts</a></h2>
-<p><strong>Note:</strong> The <em>quilt</em> feature is only available in Walrus version <em>v1.28</em> or higher.</p>
+<p><strong>Note:</strong> The <em>quilt</em> feature is only available in Walrus version <em>v1.29</em> or higher.</p>
 <div id="admonition-warning-1" class="admonition admonish-warning" role="note" aria-labelledby="admonition-warning-1-title">
 <div class="admonition-title">
 <div id="admonition-warning-1-title">
@@ -514,14 +535,16 @@ name is used instead.</p>
 <p>You can retrieve individual blobs (formally "patches") from a quilt without downloading the
 entire quilt. The <code>read-quilt</code> command allows you to query for specific blobs by their identifier,
 tags, or unique patch ID.</p>
-<p>To read blobs by their identifiers, repeating the <code>--identifiers</code> flag:</p>
+<p>To read blobs by their identifiers, use the <code>--identifiers</code> flag:</p>
 <pre><code class="language-sh">walrus read-quilt --out &lt;download dir&gt; \
   --quilt-id 057MX9PAaUIQLliItM_khR_cp5jPHzJWf-CuJr1z1ik --identifiers walrus.jpg another-walrus.jpg
 </code></pre>
-<p>To read blobs by a tag:</p>
+<p>Blobs within a quilt can be accessed and filtered based on their tags. For instance, if you have a
+collection of animal images stored in a quilt, each labeled with a species tag such as "species=cat,"
+you can download <strong>all</strong> images labeled as cats with the following command:</p>
 <pre><code class="language-sh"># Read all blobs with tag "size: medium"
 walrus read-quilt --out &lt;download dir&gt; \
-  --quilt-id 057MX9PAaUIQLliItM_khR_cp5jPHzJWf-CuJr1z1ik --tag size medium
+  --quilt-id 057MX9PAaUIQLliItM_khR_cp5jPHzJWf-CuJr1z1ik --tag species cat
 </code></pre>
 <p>You can also read a blob using its QuiltPatchId, which can be retrieved using
 <a href="#list-patches-in-a-quilt"><code>list-patches-in-quilt</code></a>.</p>
