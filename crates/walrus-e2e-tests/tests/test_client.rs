@@ -7,12 +7,10 @@
 //! Contains end-to-end tests for the Walrus client interacting with a Walrus test cluster.
 
 #[cfg(msim)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
-};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     num::NonZeroU16,
     path::PathBuf,
     str::FromStr,
@@ -20,6 +18,7 @@ use std::{
 };
 
 use rand::{Rng, random, seq::SliceRandom, thread_rng};
+use reqwest::Url;
 #[cfg(msim)]
 use sui_macros::{clear_fail_point, register_fail_point_if};
 use sui_types::base_types::{SUI_ADDRESS_LENGTH, SuiAddress};
@@ -37,6 +36,7 @@ use walrus_core::{
         EncodingConfigTrait as _,
         Primary,
         QUILT_TYPE_VALUE,
+        encoded_blob_length_for_n_shards,
         quilt_encoding::{QuiltApi, QuiltStoreBlob, QuiltVersionV1},
     },
     merkle::Node,
@@ -53,7 +53,9 @@ use walrus_sdk::{
         WalrusStoreBlobApi,
         quilt_client::QuiltClientConfig,
         responses::{BlobStoreResult, QuiltStoreResult},
+        upload_relay_client::UploadRelayClient,
     },
+    config::ClientConfig,
     error::{
         ClientError,
         ClientErrorKind::{
@@ -65,6 +67,7 @@ use walrus_sdk::{
         },
     },
     store_optimizations::StoreOptimizations,
+    upload_relay::tip_config::{TipConfig, TipKind},
 };
 use walrus_service::test_utils::{
     StorageNodeHandleTrait,
@@ -82,7 +85,8 @@ use walrus_sui::{
         SuiContractClient,
         retry_client::{RetriableSuiClient, retriable_sui_client::LazySuiClientBuilder},
     },
-    test_utils::{self},
+    config::WalletConfig,
+    test_utils::{self, fund_addresses, wallet_for_testing},
     types::{
         Blob,
         BlobEvent,
@@ -92,7 +96,12 @@ use walrus_sui::{
     },
 };
 use walrus_test_utils::{Result as TestResult, WithTempDir, assert_unordered_eq, async_param_test};
-use walrus_utils::backoff::ExponentialBackoffConfig;
+use walrus_upload_relay::{
+    DEFAULT_SERVER_ADDRESS,
+    UploadRelayHandle,
+    controller::{WalrusUploadRelayConfig, get_client_with_config},
+};
+use walrus_utils::{backoff::ExponentialBackoffConfig, metrics::Registry};
 
 async_param_test! {
     #[ignore = "ignore E2E tests by default"]
@@ -106,7 +115,7 @@ async_param_test! {
 async fn test_store_and_read_blob_without_failures(blob_size: usize) {
     telemetry_subscribers::init_for_testing();
     assert!(matches!(
-        run_store_and_read_with_crash_failures(&[], &[], blob_size).await,
+        run_store_and_read_with_crash_failures(&[], &[], blob_size, None).await,
         Ok(()),
     ))
 }
@@ -115,10 +124,11 @@ async fn test_store_and_read_blob_without_failures(blob_size: usize) {
 ///
 /// It generates random blobs and stores them.
 /// It then reads the blobs back and verifies that the data is correct.
-pub async fn basic_store_and_read<F>(
+async fn basic_store_and_read<F>(
     client: &WithTempDir<Client<SuiContractClient>>,
     num_blobs: usize,
     data_length: usize,
+    upload_relay_client: Option<UploadRelayClient>,
     pre_read_hook: F,
 ) -> TestResult
 where
@@ -137,7 +147,15 @@ where
         blobs_with_paths.push((path, data.to_vec()));
     }
 
-    let store_args = StoreArgs::default_with_epochs(1).no_store_optimizations();
+    let store_args = {
+        let store_args = StoreArgs::default_with_epochs(1).no_store_optimizations();
+        if let Some(upload_relay_client) = upload_relay_client {
+            store_args.with_upload_relay_client(upload_relay_client)
+        } else {
+            store_args
+        }
+    };
+
     let store_result = client
         .as_ref()
         .reserve_and_store_blobs_retry_committees_with_path(&blobs_with_paths, &store_args)
@@ -199,9 +217,13 @@ async fn test_store_and_read_blob_with_crash_failures(
     expected_errors: &[ClientErrorKind],
 ) {
     telemetry_subscribers::init_for_testing();
-    let result =
-        run_store_and_read_with_crash_failures(failed_shards_write, failed_shards_read, 31415)
-            .await;
+    let result = run_store_and_read_with_crash_failures(
+        failed_shards_write,
+        failed_shards_read,
+        31415,
+        None,
+    )
+    .await;
 
     match (result, expected_errors) {
         (Ok(()), []) => (),
@@ -228,6 +250,7 @@ async fn run_store_and_read_with_crash_failures(
     failed_shards_write: &[usize],
     failed_shards_read: &[usize],
     data_length: usize,
+    upload_relay_client: Option<UploadRelayClient>,
 ) -> TestResult {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -251,7 +274,7 @@ async fn run_store_and_read_with_crash_failures(
     };
 
     // Use basic_store_and_read with our pre_read_hook.
-    basic_store_and_read(&client, 4, data_length, pre_read_hook).await
+    basic_store_and_read(&client, 4, data_length, upload_relay_client, pre_read_hook).await
 }
 
 async_param_test! {
@@ -1233,7 +1256,7 @@ async fn test_walrus_subsidies_get_called_by_node() -> TestResult {
 
     let epoch = client.as_ref().sui_client().current_epoch().await?;
     // Use basic_store_and_read with our pre_read_hook.
-    basic_store_and_read(&client, 4, 314, || Ok(())).await?;
+    basic_store_and_read(&client, 4, 314, None, || Ok(())).await?;
 
     // Wait for the cluster to reach two epochs ahead of the current epoch. This is to ensure that
     // the subsidies are processed at least once between checking the initial and final funds, since
@@ -2251,7 +2274,7 @@ async fn test_ptb_retriable_error() -> TestResult {
         test_cluster::E2eTestSetupBuilder::new().build().await?;
 
     // Create an atomic counter to track number of failure attempts
-    let failure_counter = Arc::new(AtomicU32::new(0));
+    let failure_counter = std::sync::Arc::new(AtomicU32::new(0));
     let failure_counter_clone = failure_counter.clone();
 
     // Register a fail point that will fail the first 2 attempts and succeed on the 3rd
@@ -2360,4 +2383,311 @@ pub async fn test_select_coins_max_objects() -> TestResult {
     }
 
     Ok(())
+}
+
+#[ignore = "ignore E2E tests by default"]
+#[walrus_simtest]
+async fn test_store_with_upload_relay_no_tip() {
+    telemetry_subscribers::init_for_testing();
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Start the Sui and Walrus clusters.
+    let (sui_cluster_handle, _cluster, cluster_client, _) =
+        test_cluster::E2eTestSetupBuilder::new()
+            .build()
+            .await
+            .expect("setup should succeed");
+
+    // Get the cluster wallet so we can fund the client wallet.
+    let cluster_wallet_path = sui_cluster_handle.lock().await.wallet_path().await;
+    let mut cluster_wallet = walrus_sui::config::load_wallet_context_from_path(
+        Some(cluster_wallet_path.as_path()),
+        None,
+    )
+    .expect("loading cluster wallet should succeed");
+
+    let mut relay_wallet = wallet_for_testing(&mut cluster_wallet, false)
+        .await
+        .expect("wallet creation should succeed");
+    fund_addresses(
+        &mut cluster_wallet,
+        vec![
+            relay_wallet
+                .inner
+                .active_address()
+                .expect("relay wallet active address should exist"),
+        ],
+        Some(10_000_000_000),
+    )
+    .await
+    .expect("funding wallet should succeed");
+
+    // Create the Walrus config for the upload relay.
+    let cluster_config = cluster_client.inner.config();
+    let walrus_client_config = ClientConfig {
+        wallet_config: Some(WalletConfig::from_path(cluster_wallet_path)),
+        rpc_urls: vec![
+            sui_cluster_handle
+                .lock()
+                .await
+                .cluster()
+                .rpc_url()
+                .to_string(),
+        ],
+        ..cluster_config.clone()
+    };
+    let server_address: SocketAddr = DEFAULT_SERVER_ADDRESS
+        .parse()
+        .expect("valid server address");
+
+    let registry = Registry::default();
+
+    let upload_relay_sui_client = get_client_with_config(walrus_client_config, &registry)
+        .await
+        .expect("create upload relay sui client");
+    let upload_relay_handle: UploadRelayHandle = walrus_upload_relay::start_upload_relay(
+        upload_relay_sui_client,
+        WalrusUploadRelayConfig {
+            tip_config: TipConfig::NoTip,
+            tx_freshness_threshold: Duration::from_secs(300),
+            tx_max_future_threshold: Duration::from_secs(10),
+        },
+        server_address,
+        registry,
+    )
+    .expect("start upload relay should succeed");
+
+    upload_relay_handle
+        .wait_for_tcp_bind()
+        .await
+        .expect("wait for TCP bind");
+
+    let n_shards = cluster_client.inner.encoding_config().n_shards();
+    let upload_relay_url = get_upload_relay_url(&server_address);
+    let upload_relay_client = UploadRelayClient::new(
+        relay_wallet
+            .inner
+            .active_address()
+            .expect("client wallet active address should exist"),
+        n_shards,
+        upload_relay_url,
+        None,
+        Default::default(),
+    )
+    .await
+    .expect("upload relay client creation should succeed");
+    match basic_store_and_read(&cluster_client, 1, 40000, Some(upload_relay_client), || {
+        Ok(())
+    })
+    .await
+    {
+        Ok(_) => {}
+        Err(error) => {
+            panic!("store and read with upload relay should succeed: {error}")
+        }
+    };
+    upload_relay_handle
+        .shutdown()
+        .await
+        .expect("shutdown upload relay");
+}
+
+#[cfg(msim)]
+fn get_upload_relay_url(server_address: &SocketAddr) -> Url {
+    format!(
+        "http://1.1.1.1:{server_port}",
+        server_port = server_address.port()
+    )
+    .parse()
+    .expect("valid URL")
+}
+
+#[cfg(not(msim))]
+fn get_upload_relay_url(server_address: &SocketAddr) -> Url {
+    format!(
+        "http://127.0.0.1:{server_port}",
+        server_port = server_address.port()
+    )
+    .parse()
+    .expect("valid URL")
+}
+
+#[ignore = "ignore E2E tests by default"]
+#[walrus_simtest]
+async fn test_store_with_upload_relay_with_tip() {
+    telemetry_subscribers::init_for_testing();
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Start the Sui and Walrus clusters.
+    let (sui_cluster_handle, _cluster, cluster_client, _system_context) =
+        test_cluster::E2eTestSetupBuilder::new()
+            .build()
+            .await
+            .expect("setup should succeed");
+
+    // Get the cluster wallet so we can fund the client wallet.
+    let cluster_wallet_path = sui_cluster_handle.lock().await.wallet_path().await;
+    let mut cluster_wallet = walrus_sui::config::load_wallet_context_from_path(
+        Some(cluster_wallet_path.as_path()),
+        None,
+    )
+    .expect("loading cluster wallet should succeed");
+
+    let mut relay_wallet = wallet_for_testing(&mut cluster_wallet, false)
+        .await
+        .expect("wallet creation should succeed");
+
+    let relay_address = relay_wallet
+        .inner
+        .active_address()
+        .expect("relay wallet active address should exist");
+
+    // Create the Walrus config for the upload relay.
+    let walrus_read_client_config = ClientConfig {
+        wallet_config: None,
+        rpc_urls: vec![
+            sui_cluster_handle
+                .lock()
+                .await
+                .cluster()
+                .rpc_url()
+                .to_string(),
+        ],
+        ..cluster_client.inner.config().clone()
+    };
+
+    let server_address: SocketAddr = DEFAULT_SERVER_ADDRESS
+        .parse()
+        .expect("valid server address");
+
+    const TIP_BASE: u64 = 1000;
+    const TIP_MULTIPLIER: u64 = 100;
+
+    let registry = Registry::default();
+
+    let upload_relay_sui_client = get_client_with_config(walrus_read_client_config, &registry)
+        .await
+        .expect("create upload relay sui client");
+    let upload_relay_handle = walrus_upload_relay::start_upload_relay(
+        upload_relay_sui_client,
+        WalrusUploadRelayConfig {
+            tip_config: TipConfig::SendTip {
+                address: relay_address,
+                kind: TipKind::Linear {
+                    base: TIP_BASE,
+                    encoded_size_mul_per_kib: TIP_MULTIPLIER,
+                },
+            },
+            tx_freshness_threshold: Duration::from_secs(300),
+            tx_max_future_threshold: Duration::from_secs(10),
+        },
+        server_address,
+        registry,
+    )
+    .expect("start upload relay should succeed");
+
+    upload_relay_handle
+        .wait_for_tcp_bind()
+        .await
+        .expect("wait for TCP bind");
+
+    assert_ne!(
+        cluster_wallet
+            .active_address()
+            .expect("cluster_wallet should have an address"),
+        cluster_client.inner.sui_client().address()
+    );
+    let n_shards = cluster_client.inner.encoding_config().n_shards();
+    let upload_relay_url = get_upload_relay_url(&server_address);
+    let upload_relay_client = UploadRelayClient::new(
+        cluster_client.inner.sui_client().address(),
+        n_shards,
+        upload_relay_url,
+        None,
+        Default::default(),
+    )
+    .await
+    .expect("upload relay client creation should succeed");
+
+    // Create a retry client to check balances
+    let retry_client = {
+        let rpc_url = sui_cluster_handle
+            .lock()
+            .await
+            .cluster()
+            .rpc_url()
+            .to_string();
+        RetriableSuiClient::new(
+            vec![LazySuiClientBuilder::new(&rpc_url, None)],
+            ExponentialBackoffConfig::default(),
+        )
+        .await
+        .expect("create retry client")
+    };
+
+    // Get initial balance of relay wallet to verify tip payment
+    let initial_relay_balance = retry_client
+        .get_balance(relay_address, None)
+        .await
+        .expect("get balance")
+        .total_balance;
+
+    const BLOB_SIZE: usize = 40000;
+    match basic_store_and_read(
+        &cluster_client,
+        1,
+        BLOB_SIZE,
+        Some(upload_relay_client),
+        || Ok(()),
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(error) => {
+            panic!("store and read with upload relay should succeed: {error}")
+        }
+    };
+
+    // Verify that the relay wallet received a tip
+    let final_relay_balance = retry_client
+        .get_balance(relay_address, None)
+        .await
+        .expect("get balance")
+        .total_balance;
+
+    tracing::info!(
+        "Relay address balance - Initial: {initial_relay_balance}, Final: {final_relay_balance}",
+    );
+
+    assert!(
+        final_relay_balance > initial_relay_balance,
+        "Relay wallet should have received a tip. Initial: {initial_relay_balance}, \
+        Final: {final_relay_balance}",
+    );
+
+    // Calculate expected tip based on the linear formula.
+    let encoded_blob_size =
+        encoded_blob_length_for_n_shards(n_shards, BLOB_SIZE as u64, EncodingType::RS2)
+            .expect("encoded blob size should be valid");
+
+    let expected_tip_lower_bound =
+        u128::from(TIP_BASE + encoded_blob_size.div_ceil(1024) * TIP_MULTIPLIER);
+    let actual_tip = final_relay_balance - initial_relay_balance;
+
+    tracing::info!(
+        "Tip paid: {} (expected at least: {})",
+        actual_tip,
+        expected_tip_lower_bound
+    );
+
+    assert_eq!(
+        actual_tip, expected_tip_lower_bound,
+        "Tip should be the calculated minimum. Actual: {actual_tip}, \
+        Expected minimum: {expected_tip_lower_bound}",
+    );
+
+    upload_relay_handle
+        .shutdown()
+        .await
+        .expect("shutdown upload relay");
 }
