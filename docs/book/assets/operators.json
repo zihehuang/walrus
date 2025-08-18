@@ -31,7 +31,7 @@
       },
       "https://aggregator.walrus.mainnet.mozcomputing.dev": {
         "operator": "MozComputing",
-        "cache": true
+        "functional": false
       },
       "https://aggregator.walrus.silentvalidator.com": {
         "operator": "Silent",
@@ -291,7 +291,7 @@
       },
       "https://testnet-aggregator-walrus.kiliglab.io": {
         "operator": "KiligLab",
-        "cache": true
+        "cache": false
       },
       "https://testnet-aggregator.walrus.graphyte.dev": {
         "operator": "Graphyte Labs",
@@ -343,7 +343,7 @@
       },
       "https://walrus-aggregator.thcloud.dev": {
         "operator": "THCloudAI",
-        "cache": true
+        "cache": false
       },
       "https://walrus-test-aggregator.thepassivetrust.com": {
         "operator": "TPT",
@@ -435,7 +435,7 @@
       },
       "https://walrus-testnet-aggregator.talentum.id": {
         "operator": "Talentum",
-        "cache": true
+        "cache": false
       },
       "https://walrus-testnet-aggregator.trusted-point.com": {
         "operator": "TrustedPoint",
@@ -463,7 +463,7 @@
       },
       "https://walrus.testnet.aggregator.stakepool.dev.br": {
         "operator": "StakePool",
-        "cache": false
+        "cache": true
       },
       "https://walrusagg.testnet.pops.one": {
         "operator": "P-OPS Team",
@@ -475,7 +475,7 @@
       },
       "http://walrus-storage.testnet.nelrann.org:9000": {
         "operator": "Nelrann",
-        "cache": true
+        "cache": false
       },
       "http://walrus-testnet.equinoxdao.xyz:9000": {
         "operator": "EquinoxDao",
